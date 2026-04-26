@@ -15,6 +15,15 @@ onvif-discover → onvif-rtsp → go2rtc-gen
                             ↘ nvrd  (drives all of the above)
 ```
 
+## Demo
+
+`nvrd --check` against a real ONVIF camera (validates config + dependencies +
+camera resolution, exits without recording):
+
+[![asciicast](https://asciinema.org/a/sTpDdhgHc4xPd4G2.svg)](https://asciinema.org/a/sTpDdhgHc4xPd4G2)
+
+Each leaf script's repo carries its own demo. See the table below for links.
+
 ## What's in the box
 
 | Repo | One-line summary |
