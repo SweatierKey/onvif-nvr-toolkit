@@ -297,6 +297,11 @@ class CameraWorker(threading.Thread):
         self.play_proc: Optional[subprocess.Popen] = None
         self._current_day: Optional[str] = None
         self._current_dir: Optional[Path] = None
+        # _stop_subprocesses is called both by Orchestrator.run() in its
+        # finally and by the worker's own thread on exit. Serialize so we
+        # only log/SIGINT once.
+        self._shutdown_lock = threading.Lock()
+        self._stopped = False
 
     # ----- public lifecycle -----
 
@@ -452,23 +457,27 @@ class CameraWorker(threading.Thread):
                 logger.exception("[%s] merge for %s failed", self.cam.name, previous_day)
 
     def _stop_subprocesses(self) -> None:
-        for label, proc in (("rtsp-record", self.record_proc),
-                            ("rtsp-play", self.play_proc)):
-            if proc and proc.poll() is None:
-                logger.info("[%s] stopping %s", self.cam.name, label)
-                try:
-                    proc.send_signal(signal.SIGINT)
-                except ProcessLookupError:
-                    continue
-                try:
-                    proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    logger.warning("[%s] %s did not exit; killing",
-                                   self.cam.name, label)
-                    proc.kill()
-                    proc.wait()
-        self.record_proc = None
-        self.play_proc = None
+        with self._shutdown_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            for label, proc in (("rtsp-record", self.record_proc),
+                                ("rtsp-play", self.play_proc)):
+                if proc and proc.poll() is None:
+                    logger.info("[%s] stopping %s", self.cam.name, label)
+                    try:
+                        proc.send_signal(signal.SIGINT)
+                    except ProcessLookupError:
+                        continue
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        logger.warning("[%s] %s did not exit; killing",
+                                       self.cam.name, label)
+                        proc.kill()
+                        proc.wait()
+            self.record_proc = None
+            self.play_proc = None
 
 
 # ---------------------------------------------------------------------------
