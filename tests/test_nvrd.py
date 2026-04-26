@@ -329,6 +329,70 @@ class MergeSegmentsTests(unittest.TestCase):
 # Orchestrator.gather_cameras (config -> Camera list)
 # ---------------------------------------------------------------------------
 
+class RenderGo2rtcYamlTests(unittest.TestCase):
+    def _cams(self, *names_and_urls):
+        return [nvrd.Camera(name=n, device_url=u, user="", password="",
+                            inject_credentials=False, rtsp_url=u)
+                for n, u in names_and_urls]
+
+    def test_basic_layout(self):
+        cams = self._cams(
+            ("cam-front", "rtsp://1.1.1.1/main"),
+            ("cam-back",  "rtsp://2.2.2.2/main"),
+        )
+        out = nvrd.render_go2rtc_yaml(cams, "127.0.0.1", 8554, 1984)
+        self.assertEqual(
+            out,
+            "api:\n"
+            "  listen: 127.0.0.1:1984\n"
+            "rtsp:\n"
+            "  listen: 127.0.0.1:8554\n"
+            "streams:\n"
+            "  cam-front: rtsp://1.1.1.1/main\n"
+            "  cam-back: rtsp://2.2.2.2/main\n",
+        )
+
+    def test_url_with_credentials_quoted(self):
+        cams = self._cams(("cam1", "rtsp://u:p@host/x"))
+        out = nvrd.render_go2rtc_yaml(cams, "127.0.0.1", 8554, 1984)
+        self.assertIn('cam1: "rtsp://u:p@host/x"', out)
+
+    def test_bind_zero_addr(self):
+        out = nvrd.render_go2rtc_yaml([], "0.0.0.0", 8554, 1984)
+        self.assertIn("listen: 0.0.0.0:1984", out)
+        self.assertIn("listen: 0.0.0.0:8554", out)
+
+
+class ProxyConfigValidationTests(unittest.TestCase):
+    def _load(self, body):
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.yaml")
+            with open(p, "w") as f:
+                f.write(body)
+            return nvrd.load_config(p)
+
+    def test_bad_mode_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._load("proxy:\n  mode: nope\n")
+
+    def test_bad_port_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._load("proxy:\n  rtsp_port: 99999\n")
+
+    def test_same_ports_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._load("proxy:\n  rtsp_port: 1984\n  api_port: 1984\n")
+
+    def test_default_mode_is_proxy(self):
+        cfg = nvrd.load_config(None)
+        self.assertEqual(cfg["proxy"]["mode"], "proxy")
+        self.assertEqual(cfg["proxy"]["bind"], "127.0.0.1")
+
+
 class GatherCamerasTests(unittest.TestCase):
     def _orch(self, cfg_overrides):
         cfg = nvrd.load_config(None)
@@ -393,12 +457,68 @@ class CliMetaTests(unittest.TestCase):
 
 
 class CliCheckTests(unittest.TestCase):
-    def test_check_with_all_mocks_succeeds(self):
+    def test_check_direct_mode_with_mocks_succeeds(self):
+        # proxy.mode=direct so we don't require go2rtc in PATH for this test.
         with tempfile.TemporaryDirectory() as d, \
              _MockLeavesPath(list(nvrd.LEAF_SCRIPTS)) as mp:
             mp.set_stdout("onvif-discover", "http://1.1.1.1/x\n")
             mp.set_stdout("onvif-rtsp", "rtsp://anon/s\n")
 
+            cfg_path = os.path.join(d, "c.yaml")
+            with open(cfg_path, "w") as f:
+                f.write(f"""
+storage:
+  base_dir: {d}
+discovery:
+  mode: auto
+  timeout: 2
+proxy:
+  mode: direct
+auth:
+  user: ""
+  password: ""
+""")
+            env = dict(os.environ); env["PATH"] = mp.dir + os.pathsep + env["PATH"]
+            r = _run_cli(["-c", cfg_path, "--check"], env=env)
+            self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+            self.assertIn("check OK", r.stdout)
+            self.assertIn("proxy.mode=direct", r.stdout)
+
+    def test_check_proxy_mode_without_go2rtc_errors(self):
+        # proxy mode (default) must complain when go2rtc is missing.
+        with tempfile.TemporaryDirectory() as d, \
+             _MockLeavesPath(list(nvrd.LEAF_SCRIPTS)) as mp:
+            mp.set_stdout("onvif-discover", "http://1.1.1.1/x\n")
+            mp.set_stdout("onvif-rtsp", "rtsp://anon/s\n")
+
+            cfg_path = os.path.join(d, "c.yaml")
+            with open(cfg_path, "w") as f:
+                # Leave proxy.mode at default ("proxy")
+                f.write(f"""
+storage:
+  base_dir: {d}
+discovery:
+  mode: auto
+  timeout: 2
+auth:
+  user: ""
+  password: ""
+""")
+            # PATH only has the mock leaves; no go2rtc anywhere.
+            env = {"PATH": mp.dir}
+            if "SystemRoot" in os.environ:
+                env["SystemRoot"] = os.environ["SystemRoot"]
+            r = _run_cli(["-c", cfg_path, "--check"], env=env)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("go2rtc not in PATH", r.stdout + r.stderr)
+
+    def test_check_proxy_mode_with_go2rtc_mock_succeeds(self):
+        # With a fake go2rtc in PATH, --check (which doesn't actually start
+        # go2rtc) succeeds.
+        with tempfile.TemporaryDirectory() as d, \
+             _MockLeavesPath(list(nvrd.LEAF_SCRIPTS) + ["go2rtc"]) as mp:
+            mp.set_stdout("onvif-discover", "http://1.1.1.1/x\n")
+            mp.set_stdout("onvif-rtsp", "rtsp://anon/s\n")
             cfg_path = os.path.join(d, "c.yaml")
             with open(cfg_path, "w") as f:
                 f.write(f"""
@@ -414,7 +534,7 @@ auth:
             env = dict(os.environ); env["PATH"] = mp.dir + os.pathsep + env["PATH"]
             r = _run_cli(["-c", cfg_path, "--check"], env=env)
             self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
-            self.assertIn("check OK", r.stdout)
+            self.assertIn("proxy.mode=proxy", r.stdout)
 
 
 if __name__ == "__main__":

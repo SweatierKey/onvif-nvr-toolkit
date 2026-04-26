@@ -68,6 +68,33 @@ auth:
   # Per-request HTTP timeout for the SOAP calls onvif-rtsp makes.
   timeout: 10
 
+# How nvrd routes the camera streams.
+#
+#   proxy: nvrd starts a local go2rtc instance, points record/play at it
+#          via rtsp://127.0.0.1:8554/<cam-name>. Each camera sees ONE
+#          connection (from go2rtc); record + play + any other consumer
+#          (Frigate, Home Assistant, ...) tap the local stream instead.
+#          go2rtc must be in PATH — single static binary from
+#          https://github.com/AlexxIT/go2rtc/releases. Recommended.
+#
+#   direct: record/play hit the cameras directly. Cheap cameras may
+#           reboot under multiple concurrent RTSP connections; only use
+#           this if you're sure your cam can handle it or you only ever
+#           do one of record/play at a time.
+proxy:
+  mode: proxy
+
+  # bind: where go2rtc listens. 127.0.0.1 keeps everything local —
+  # only nvrd sees the streams. Set to 0.0.0.0 to share with Frigate /
+  # Home Assistant / other host on the LAN.
+  bind: 127.0.0.1
+  rtsp_port: 8554
+  api_port: 1984
+
+  # How long (seconds) nvrd waits for the go2rtc API to come online
+  # after starting it.
+  ready_timeout: 15
+
 # Optional foreground playback. When enabled, nvrd opens one rtsp-play per
 # camera (mpv preferred) on the local display while recording continues in
 # the background. Useful for kiosks / control rooms.

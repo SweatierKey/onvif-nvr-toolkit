@@ -85,9 +85,27 @@ ls /srv/footage/2026-04-26_*.mp4 | footage-merge -o /srv/footage/2026-04-26.mp4
 ## Quick tour (with `nvrd`)
 
 `nvrd` is the long-running daemon that runs the same chain for you. It does
-discovery, starts a `rtsp-record` per camera, optionally opens `rtsp-play`
-in foreground, monitors health, rotates files at midnight and merges the
-day's segments automatically.
+discovery, starts a [`go2rtc`](https://github.com/AlexxIT/go2rtc) proxy
+(one connection per camera, instead of one per consumer), starts a
+`rtsp-record` per camera, optionally opens `rtsp-play` in foreground,
+monitors health, rotates files at midnight and merges the day's segments
+automatically.
+
+### Architecture
+
+```
+   ┌──────┐   1×RTSP    ┌────────┐   N×RTSP   ┌──────────────┐
+   │ cam1 │ ──────────> │        │ ─────────> │ rtsp-record  │
+   └──────┘             │ go2rtc │ ─────────> │ rtsp-play    │
+                        │  :8554 │ ─────────> │ Frigate, HA, │
+   ┌──────┐   1×RTSP    │        │            │ web UI, ...  │
+   │ cam2 │ ──────────> │        │            └──────────────┘
+   └──────┘             └────────┘
+```
+
+The cameras each see exactly one RTSP connection (from go2rtc), no matter
+how many consumers tap the local proxy. Cheap firmware that reboots under
+multiple concurrent connections stays happy.
 
 ```sh
 # 1. install (this repo)
@@ -100,14 +118,27 @@ for r in onvif-discover onvif-rtsp go2rtc-gen rtsp-play rtsp-record footage-merg
   chmod +x ~/.local/bin/$r
 done
 
-# 3. write a config
+# 3. install go2rtc (single static binary; needed unless proxy.mode=direct)
+curl -L -o ~/.local/bin/go2rtc \
+    https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_amd64
+chmod +x ~/.local/bin/go2rtc
+
+# 4. install pip dep (PyYAML)
+pip install --user PyYAML  # or: apt install python3-yaml
+
+# 5. write a config
 mkdir -p ~/.config/onvif-nvr
 cp examples/config.yaml ~/.config/onvif-nvr/config.yaml
 $EDITOR ~/.config/onvif-nvr/config.yaml
 
-# 4. run
+# 6. run
 nvrd
 ```
+
+> If you don't want go2rtc in your PATH, set `proxy.mode: direct` in the
+> config — `nvrd` will skip starting it and have `rtsp-record`/`rtsp-play`
+> connect to the cameras directly. Only do this if you're sure your camera
+> can handle multiple concurrent RTSP clients.
 
 Config example (full reference in [`examples/config.yaml`](examples/config.yaml)):
 
@@ -130,6 +161,12 @@ discovery:
 auth:
   user: admin
   password: admin
+
+proxy:
+  mode: proxy                 # proxy | direct
+  bind: 127.0.0.1             # change to 0.0.0.0 to share streams over LAN
+  rtsp_port: 8554
+  api_port: 1984
 
 playback:
   enabled: false              # set to true to also open mpv/ffplay
