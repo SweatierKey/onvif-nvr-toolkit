@@ -1,0 +1,97 @@
+# Annotated reference config for nvrd. Defaults shown are what you get if
+# you omit a key entirely. Copy to ~/.config/onvif-nvr/config.yaml and
+# edit. Keep the file readable only to its owner — it carries credentials.
+#
+#   chmod 600 ~/.config/onvif-nvr/config.yaml
+
+storage:
+  # Root directory for all recordings. Per-camera, per-day subfolders are
+  # created underneath. Must exist; nvrd creates the cam/date folders but
+  # not the base.
+  base_dir: /srv/footage
+
+schedule:
+  # Length of each recorded segment, in seconds. Smaller = more granular
+  # restart on failures but more files; larger = fewer files. 600 = 10 min
+  # is a sensible default for 24/7 recording.
+  segment_duration: 600
+
+  # Local clock time at which nvrd rotates to a new day's folder, stops
+  # the previous rtsp-record, runs footage-merge for that day, then starts
+  # a fresh rtsp-record. "00:00" = midnight.
+  rotate_at: "00:00"
+
+  # If true, the just-finished day's segments are concatenated into
+  # _merged-<YYYY-MM-DD>.mp4 in the same per-day folder. Set to false if
+  # you only want raw segments and prefer to merge later by hand.
+  merge_on_rotate: true
+
+  # If true, the original per-segment files are removed once the merged
+  # file has been written successfully. Default is false — keep both.
+  delete_segments_after_merge: false
+
+discovery:
+  # auto: run onvif-discover at startup; nvrd records every camera that
+  #       responds with the same `auth` block (per-camera overrides below
+  #       can override auth).
+  # static: only the cameras listed in `cameras:` below are managed; no
+  #         WS-Discovery probe is sent.
+  mode: auto
+
+  # Seconds to wait for ProbeMatches replies (only meaningful for
+  # `mode: auto`).
+  timeout: 5
+
+  # Used in `mode: static`, optional in `mode: auto` (override individual
+  # cameras' settings). `name` is used as the directory name on disk;
+  # leaving it unset derives a name from the IP.
+  cameras: []
+  # cameras:
+  #   - name: cam-front
+  #     device_url: http://192.168.0.73:8899/onvif/device_service
+  #     # Optional per-camera credential override. Falls back to the global
+  #     # `auth:` block if absent.
+  #     # user: admin
+  #     # password: notSoSecret
+  #     # Inject credentials into the RTSP URL itself. Default true: this
+  #     # is what most cheap cameras require for the RTSP stream.
+  #     inject_credentials: true
+
+auth:
+  # Default credentials, used unless overridden per-camera.
+  user: admin
+  password: admin
+
+  # Inject creds into the RTSP URL ffmpeg/mpv get. Default true.
+  inject_credentials: true
+
+  # Per-request HTTP timeout for the SOAP calls onvif-rtsp makes.
+  timeout: 10
+
+# Optional foreground playback. When enabled, nvrd opens one rtsp-play per
+# camera (mpv preferred) on the local display while recording continues in
+# the background. Useful for kiosks / control rooms.
+playback:
+  enabled: false
+
+  # auto | mpv | ffplay
+  player: auto
+  transport: tcp
+  no_audio: true
+
+# How healthy nvrd thinks each camera is. When verify_recording is true
+# nvrd checks every `interval` seconds that the segment file currently
+# being written is growing. If it hasn't grown after `stale_grace`
+# seconds, that camera's rtsp-record is restarted.
+monitor:
+  interval: 30
+  verify_recording: true
+  stale_grace: 60
+
+logging:
+  # info | debug | warning | error
+  level: info
+
+  # Log destination in addition to stdout. Set to null (or omit) to log
+  # only to stdout. The directory must exist; nvrd does not create it.
+  file: ~/.local/state/nvrd.log

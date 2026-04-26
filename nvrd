@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+"""nvrd: orchestrate the onvif-nvr-toolkit chain as a long-running daemon.
+
+Drives onvif-discover, onvif-rtsp, rtsp-record, optional rtsp-play and
+footage-merge on a schedule, with per-camera health monitoring and
+midnight rotation. All real work is shelled out to the leaf scripts;
+nvrd just wires them together.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime as _dt
+import logging
+import logging.handlers
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+VERSION = "1.0.0"
+PROG = "nvrd"
+
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_NETWORK = 2
+EXIT_PROTOCOL = 4
+EXIT_INTERRUPT = 130
+
+# Leaf scripts we shell out to. They must all be in PATH.
+LEAF_SCRIPTS = (
+    "onvif-discover",
+    "onvif-rtsp",
+    "rtsp-record",
+    "rtsp-play",
+    "footage-merge",
+)
+
+# Tags used in fixed file/folder names. Kept here so tests can reference them.
+SEGMENT_FILENAME_PATTERN = "cam-%Y-%m-%d_%H-%M-%S.mp4"
+MERGED_FILENAME_TEMPLATE = "_merged-{date}.mp4"
+DATE_FOLDER_FORMAT = "%Y-%m-%d"
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(PROG)
+
+
+def _setup_logging(level_name: str, file_path: Optional[str]) -> None:
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logger.setLevel(level)
+    fmt = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # Stdout handler: always on. Logs go to stdout, not stderr, because the
+    # user explicitly asked for stdout.
+    stdout_h = logging.StreamHandler(sys.stdout)
+    stdout_h.setFormatter(fmt)
+    logger.addHandler(stdout_h)
+    if file_path:
+        path = os.path.expanduser(file_path)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        file_h = logging.handlers.RotatingFileHandler(
+            path, maxBytes=10 * 1024 * 1024, backupCount=5,
+        )
+        file_h.setFormatter(fmt)
+        logger.addHandler(file_h)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "storage": {"base_dir": "/srv/footage"},
+    "schedule": {
+        "segment_duration": 600,
+        "rotate_at": "00:00",
+        "merge_on_rotate": True,
+        "delete_segments_after_merge": False,
+    },
+    "discovery": {
+        "mode": "auto",
+        "timeout": 5,
+        "cameras": [],
+    },
+    "auth": {
+        "user": "",
+        "password": "",
+        "inject_credentials": True,
+        "timeout": 10,
+    },
+    "playback": {
+        "enabled": False,
+        "player": "auto",
+        "transport": "tcp",
+        "no_audio": True,
+    },
+    "monitor": {
+        "interval": 30,
+        "verify_recording": True,
+        "stale_grace": 60,
+    },
+    "logging": {
+        "level": "info",
+        "file": None,
+    },
+}
+
+
+def _deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
+
+
+def load_config(path: Optional[str]) -> Dict[str, Any]:
+    """Load a YAML config from `path`, merge over the defaults. If path is
+    None, returns just the defaults — useful for `--auto` no-config mode."""
+    cfg = _clone(DEFAULT_CONFIG)
+    if not path:
+        return cfg
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        raise SystemExit(
+            f"{PROG}: PyYAML not installed (install with: pip install pyyaml)"
+        )
+    p = Path(os.path.expanduser(path))
+    if not p.is_file():
+        raise SystemExit(f"{PROG}: config file not found: {path}")
+    with open(p, "r", encoding="utf-8") as f:
+        loaded = yaml.safe_load(f) or {}
+    if not isinstance(loaded, dict):
+        raise SystemExit(f"{PROG}: config root must be a mapping")
+    _deep_merge(cfg, loaded)
+    _validate_config(cfg)
+    return cfg
+
+
+def _clone(d: Any) -> Any:
+    if isinstance(d, dict):
+        return {k: _clone(v) for k, v in d.items()}
+    if isinstance(d, list):
+        return [_clone(x) for x in d]
+    return d
+
+
+def _validate_config(cfg: Dict[str, Any]) -> None:
+    sched = cfg["schedule"]
+    if not isinstance(sched["segment_duration"], int) or sched["segment_duration"] <= 0:
+        raise SystemExit(f"{PROG}: schedule.segment_duration must be a positive integer")
+    rotate = sched["rotate_at"]
+    if not (isinstance(rotate, str) and re.fullmatch(r"\d{1,2}:\d{2}", rotate)):
+        raise SystemExit(f"{PROG}: schedule.rotate_at must be HH:MM (e.g. \"00:00\")")
+    h, m = (int(x) for x in rotate.split(":"))
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise SystemExit(f"{PROG}: schedule.rotate_at out of range: {rotate!r}")
+
+    disc = cfg["discovery"]
+    if disc["mode"] not in ("auto", "static"):
+        raise SystemExit(f"{PROG}: discovery.mode must be 'auto' or 'static'")
+    if disc["mode"] == "static" and not disc.get("cameras"):
+        raise SystemExit(f"{PROG}: discovery.mode=static requires discovery.cameras")
+
+    pb = cfg["playback"]
+    if pb["player"] not in ("auto", "mpv", "ffplay"):
+        raise SystemExit(f"{PROG}: playback.player must be auto|mpv|ffplay")
+    if pb["transport"] not in ("tcp", "udp"):
+        raise SystemExit(f"{PROG}: playback.transport must be tcp|udp")
+
+
+# ---------------------------------------------------------------------------
+# Camera modeling
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class Camera:
+    name: str
+    device_url: str
+    user: str
+    password: str
+    inject_credentials: bool
+    rtsp_url: Optional[str] = None  # populated by resolve_rtsp_url
+
+    def storage_root(self, base: str) -> Path:
+        return Path(base) / self.name
+
+
+def _safe_name_from_url(url: str) -> str:
+    """Derive a safe directory name from a device URL. e.g.
+    http://192.168.0.73:8899/onvif/device_service -> cam-192-168-0-73"""
+    p = urlparse(url)
+    host = (p.hostname or "unknown").replace(":", "-").replace(".", "-")
+    return f"cam-{host}"
+
+
+# ---------------------------------------------------------------------------
+# Subprocess helpers (calls into the leaf scripts)
+# ---------------------------------------------------------------------------
+
+def _check_leaf_scripts_in_path() -> None:
+    missing = [n for n in LEAF_SCRIPTS if not shutil.which(n)]
+    if missing:
+        raise SystemExit(
+            f"{PROG}: leaf script(s) missing from PATH: {', '.join(missing)} "
+            "— install them from the toolkit's sibling repos."
+        )
+
+
+def discover_devices(timeout: int) -> List[str]:
+    """Return the list of device service URLs reported by onvif-discover."""
+    cmd = ["onvif-discover", "-t", str(timeout)]
+    logger.debug("running: %s", " ".join(cmd))
+    try:
+        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+    except FileNotFoundError:
+        raise SystemExit(f"{PROG}: onvif-discover not in PATH")
+    if cp.returncode != 0:
+        raise SystemExit(
+            f"{PROG}: onvif-discover failed (rc={cp.returncode}): {cp.stderr.strip()}"
+        )
+    return [line.strip() for line in cp.stdout.splitlines() if line.strip()]
+
+
+def resolve_rtsp_url(cam: Camera, timeout: int) -> str:
+    """Call onvif-rtsp to resolve the RTSP URL for a camera. Returns the URL.
+    Always uses --inject-credentials when credentials are present, because the
+    URL we hand to ffmpeg/mpv has to be self-contained."""
+    cmd = ["onvif-rtsp", "-t", str(timeout)]
+    if cam.user:
+        cmd += ["--user", cam.user, "--password", cam.password]
+        if cam.inject_credentials:
+            cmd.append("--inject-credentials")
+    cmd.append(cam.device_url)
+    logger.debug("resolving rtsp for %s", cam.name)
+    cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+    if cp.returncode != 0:
+        raise RuntimeError(
+            f"onvif-rtsp failed for {cam.name}: rc={cp.returncode} {cp.stderr.strip()}"
+        )
+    url = cp.stdout.strip()
+    if not url:
+        raise RuntimeError(f"onvif-rtsp returned no URL for {cam.name}")
+    return url
+
+
+def merge_segments(input_files: List[Path], output: Path) -> None:
+    """Run footage-merge to produce `output` from `input_files`. Raises on
+    failure with a useful message."""
+    if not input_files:
+        raise RuntimeError("no input segments to merge")
+    cmd = ["footage-merge", "-o", str(output)]
+    if output.exists():
+        cmd.append("-f")
+    cmd += [str(p) for p in input_files]
+    logger.debug("merging %d segment(s) into %s", len(input_files), output)
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise RuntimeError(
+            f"footage-merge failed (rc={cp.returncode}): {cp.stderr.strip()}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-camera worker
+# ---------------------------------------------------------------------------
+
+class CameraWorker(threading.Thread):
+    """Owns the rtsp-record (and optionally rtsp-play) subprocesses for one
+    camera. Wakes up on rotation_event for end-of-day handling and on
+    stop_event for shutdown."""
+
+    def __init__(self, cam: Camera, cfg: Dict[str, Any], stop_event: threading.Event):
+        super().__init__(name=f"cam[{cam.name}]", daemon=True)
+        self.cam = cam
+        self.cfg = cfg
+        self.stop_event = stop_event
+        self.rotation_event = threading.Event()
+        self.record_proc: Optional[subprocess.Popen] = None
+        self.play_proc: Optional[subprocess.Popen] = None
+        self._current_day: Optional[str] = None
+        self._current_dir: Optional[Path] = None
+
+    # ----- public lifecycle -----
+
+    def request_rotation(self) -> None:
+        """Ask the worker to rotate at the next chance (called by main loop)."""
+        self.rotation_event.set()
+
+    def shutdown(self) -> None:
+        """Stop everything cleanly. Idempotent."""
+        self._stop_subprocesses()
+
+    # ----- thread body -----
+
+    def run(self) -> None:
+        try:
+            self._start_recording_for_today()
+            if self.cfg["playback"]["enabled"]:
+                self._start_playback()
+
+            interval = self.cfg["monitor"]["interval"]
+            verify = self.cfg["monitor"]["verify_recording"]
+            grace = self.cfg["monitor"]["stale_grace"]
+            last_size = -1
+            last_change = time.monotonic()
+
+            while not self.stop_event.is_set():
+                if self.rotation_event.is_set():
+                    self.rotation_event.clear()
+                    self._do_rotation()
+                    last_size = -1; last_change = time.monotonic()
+
+                if self.record_proc and self.record_proc.poll() is not None:
+                    rc = self.record_proc.returncode
+                    logger.warning("[%s] rtsp-record exited (rc=%s); restarting",
+                                   self.cam.name, rc)
+                    self._start_recording_for_today()
+                    last_size = -1; last_change = time.monotonic()
+
+                if self.cfg["playback"]["enabled"] and self.play_proc \
+                        and self.play_proc.poll() is not None:
+                    logger.warning("[%s] rtsp-play exited (rc=%s); restarting",
+                                   self.cam.name, self.play_proc.returncode)
+                    self._start_playback()
+
+                if verify and self._current_dir:
+                    cur = _latest_segment(self._current_dir)
+                    if cur is not None:
+                        size = cur.stat().st_size
+                        if size != last_size:
+                            last_size = size
+                            last_change = time.monotonic()
+                        elif time.monotonic() - last_change > grace:
+                            logger.warning(
+                                "[%s] segment %s has not grown in %ds — "
+                                "restarting rtsp-record",
+                                self.cam.name, cur.name, grace,
+                            )
+                            self._restart_recording()
+                            last_size = -1; last_change = time.monotonic()
+
+                # Sleep in small chunks for responsive shutdown.
+                end = time.monotonic() + interval
+                while time.monotonic() < end and not self.stop_event.is_set() \
+                        and not self.rotation_event.is_set():
+                    time.sleep(0.5)
+        except Exception:
+            logger.exception("[%s] worker crashed", self.cam.name)
+        finally:
+            self._stop_subprocesses()
+
+    # ----- subprocess management -----
+
+    def _start_recording_for_today(self) -> None:
+        today = _dt.date.today().strftime(DATE_FOLDER_FORMAT)
+        self._current_day = today
+        base = Path(self.cfg["storage"]["base_dir"]).expanduser()
+        day_dir = base / self.cam.name / today
+        day_dir.mkdir(parents=True, exist_ok=True)
+        self._current_dir = day_dir
+        pattern = str(day_dir / SEGMENT_FILENAME_PATTERN)
+        cmd = [
+            "rtsp-record",
+            "-d", str(self.cfg["schedule"]["segment_duration"]),
+            "-o", pattern,
+            self.cam.rtsp_url or "",
+        ]
+        logger.info("[%s] starting rtsp-record into %s", self.cam.name, day_dir)
+        logger.debug("[%s] exec: %s", self.cam.name, " ".join(shlex.quote(x) for x in cmd))
+        self.record_proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def _restart_recording(self) -> None:
+        if self.record_proc and self.record_proc.poll() is None:
+            self.record_proc.send_signal(signal.SIGINT)
+            try:
+                self.record_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.record_proc.kill()
+                self.record_proc.wait()
+        self._start_recording_for_today()
+
+    def _start_playback(self) -> None:
+        cfg = self.cfg["playback"]
+        cmd = ["rtsp-play",
+               "--player", cfg["player"],
+               "--transport", cfg["transport"]]
+        if cfg["no_audio"]:
+            cmd.append("--no-audio")
+        cmd.append(self.cam.rtsp_url or "")
+        logger.info("[%s] starting rtsp-play (%s)", self.cam.name, cfg["player"])
+        try:
+            self.play_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+        except OSError as e:
+            logger.error("[%s] failed to start rtsp-play: %s", self.cam.name, e)
+            self.play_proc = None
+
+    def _do_rotation(self) -> None:
+        """End-of-day: stop record, optionally merge, start fresh record."""
+        previous_day = self._current_day
+        previous_dir = self._current_dir
+        if self.record_proc and self.record_proc.poll() is None:
+            logger.info("[%s] rotating: stopping rtsp-record", self.cam.name)
+            self.record_proc.send_signal(signal.SIGINT)
+            try:
+                self.record_proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                logger.warning("[%s] rtsp-record did not exit on SIGINT; killing",
+                               self.cam.name)
+                self.record_proc.kill()
+                self.record_proc.wait()
+        self._start_recording_for_today()
+
+        if self.cfg["schedule"]["merge_on_rotate"] and previous_dir and previous_day:
+            try:
+                segs = _segment_files_in(previous_dir)
+                if segs:
+                    out = previous_dir / MERGED_FILENAME_TEMPLATE.format(date=previous_day)
+                    logger.info("[%s] merging %d segment(s) for %s",
+                                self.cam.name, len(segs), previous_day)
+                    merge_segments(segs, out)
+                    if self.cfg["schedule"]["delete_segments_after_merge"]:
+                        for s in segs:
+                            try:
+                                s.unlink()
+                            except OSError as e:
+                                logger.warning("[%s] could not delete %s: %s",
+                                               self.cam.name, s, e)
+                else:
+                    logger.warning("[%s] nothing to merge for %s", self.cam.name, previous_day)
+            except Exception:
+                logger.exception("[%s] merge for %s failed", self.cam.name, previous_day)
+
+    def _stop_subprocesses(self) -> None:
+        for label, proc in (("rtsp-record", self.record_proc),
+                            ("rtsp-play", self.play_proc)):
+            if proc and proc.poll() is None:
+                logger.info("[%s] stopping %s", self.cam.name, label)
+                try:
+                    proc.send_signal(signal.SIGINT)
+                except ProcessLookupError:
+                    continue
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    logger.warning("[%s] %s did not exit; killing",
+                                   self.cam.name, label)
+                    proc.kill()
+                    proc.wait()
+        self.record_proc = None
+        self.play_proc = None
+
+
+# ---------------------------------------------------------------------------
+# Filesystem helpers
+# ---------------------------------------------------------------------------
+
+_SEGMENT_RE = re.compile(r"^cam-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.mp4$")
+
+
+def _segment_files_in(folder: Path) -> List[Path]:
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.iterdir()
+                  if p.is_file() and _SEGMENT_RE.match(p.name))
+
+
+def _latest_segment(folder: Path) -> Optional[Path]:
+    segs = _segment_files_in(folder)
+    return segs[-1] if segs else None
+
+
+# ---------------------------------------------------------------------------
+# Rotation timing
+# ---------------------------------------------------------------------------
+
+def parse_rotate_at(text: str) -> Tuple[int, int]:
+    h, m = (int(x) for x in text.split(":"))
+    return h, m
+
+
+def next_rotation_after(now: _dt.datetime, hour: int, minute: int) -> _dt.datetime:
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += _dt.timedelta(days=1)
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+class Orchestrator:
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg
+        self.stop_event = threading.Event()
+        self.workers: List[CameraWorker] = []
+
+    def install_signal_handlers(self) -> None:
+        def handler(signum, frame):
+            logger.info("received signal %s, shutting down", signum)
+            self.stop_event.set()
+        signal.signal(signal.SIGINT, handler)
+        signal.signal(signal.SIGTERM, handler)
+
+    def gather_cameras(self) -> List[Camera]:
+        disc = self.cfg["discovery"]
+        auth = self.cfg["auth"]
+        cams: List[Camera] = []
+
+        if disc["mode"] == "static":
+            entries = list(disc.get("cameras") or [])
+        else:
+            urls = discover_devices(disc["timeout"])
+            if not urls:
+                logger.warning("onvif-discover found no devices on the LAN")
+                return []
+            entries = []
+            # Allow per-URL overrides from the static cameras list, even in
+            # auto mode — useful when you want to set a name/credentials for
+            # one specific known device but still benefit from autodiscover
+            # for the rest.
+            overrides = {c["device_url"]: c
+                         for c in (disc.get("cameras") or [])
+                         if isinstance(c, dict) and c.get("device_url")}
+            for url in urls:
+                entry = overrides.get(url, {})
+                entries.append({"device_url": url, **entry})
+
+        for entry in entries:
+            url = entry.get("device_url")
+            if not url:
+                logger.warning("skipping camera entry with no device_url: %r", entry)
+                continue
+            cams.append(Camera(
+                name=entry.get("name") or _safe_name_from_url(url),
+                device_url=url,
+                user=entry.get("user", auth["user"]) or "",
+                password=entry.get("password", auth["password"]) or "",
+                inject_credentials=entry.get("inject_credentials",
+                                             auth["inject_credentials"]),
+            ))
+        return cams
+
+    def resolve_all(self, cams: List[Camera]) -> List[Camera]:
+        ok: List[Camera] = []
+        for cam in cams:
+            try:
+                cam.rtsp_url = resolve_rtsp_url(cam, self.cfg["auth"]["timeout"])
+                logger.info("resolved %s -> %s", cam.name, cam.rtsp_url)
+                ok.append(cam)
+            except Exception as e:
+                logger.error("failed to resolve %s: %s", cam.name, e)
+        return ok
+
+    def run(self) -> int:
+        _check_leaf_scripts_in_path()
+        cams = self.resolve_all(self.gather_cameras())
+        if not cams:
+            logger.error("no cameras resolved; nothing to do")
+            return EXIT_PROTOCOL
+
+        base = Path(self.cfg["storage"]["base_dir"]).expanduser()
+        if not base.is_dir():
+            logger.error("storage.base_dir does not exist: %s", base)
+            return EXIT_USAGE
+
+        for cam in cams:
+            w = CameraWorker(cam, self.cfg, self.stop_event)
+            self.workers.append(w)
+            w.start()
+
+        rotate_h, rotate_m = parse_rotate_at(self.cfg["schedule"]["rotate_at"])
+        next_rot = next_rotation_after(_dt.datetime.now(), rotate_h, rotate_m)
+        logger.info("next rotation: %s", next_rot.isoformat(timespec="seconds"))
+
+        try:
+            while not self.stop_event.is_set():
+                now = _dt.datetime.now()
+                if now >= next_rot:
+                    logger.info("rotation tick at %s", now.isoformat(timespec="seconds"))
+                    for w in self.workers:
+                        w.request_rotation()
+                    next_rot = next_rotation_after(now + _dt.timedelta(seconds=1),
+                                                   rotate_h, rotate_m)
+                    logger.info("next rotation: %s",
+                                next_rot.isoformat(timespec="seconds"))
+                self.stop_event.wait(timeout=10)
+        finally:
+            logger.info("stopping %d worker(s)", len(self.workers))
+            for w in self.workers:
+                w.shutdown()
+            for w in self.workers:
+                w.join(timeout=20)
+        return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Long-running orchestrator for the onvif-nvr-toolkit "
+                    "(discovers cameras, records continuously in segments, "
+                    "rotates and merges daily).",
+        add_help=False,
+    )
+    default_cfg = "~/.config/onvif-nvr/config.yaml"
+    p.add_argument("-c", "--config", default=default_cfg, metavar="FILE",
+                   help=f"path to YAML config (default: {default_cfg}; pass /dev/null "
+                        "to run with built-in defaults only)")
+    p.add_argument("--check", action="store_true",
+                   help="validate config + dependencies + camera resolution, "
+                        "then exit without recording")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="bump log level to DEBUG (overrides config)")
+    p.add_argument("-V", "--version", action="store_true",
+                   help="print version and exit")
+    p.add_argument("-h", "--help", action="store_true",
+                   help="show this help and exit")
+    return p
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.help:
+        parser.print_help()
+        return EXIT_OK
+    if args.version:
+        print(f"{PROG} {VERSION}")
+        return EXIT_OK
+
+    cfg_path = args.config
+    if cfg_path and not Path(os.path.expanduser(cfg_path)).is_file():
+        # No config file present: silently fall back to defaults so the
+        # user can run `nvrd --check` to see what's missing.
+        cfg = load_config(None)
+    else:
+        cfg = load_config(cfg_path)
+
+    log_level = "debug" if args.verbose else cfg["logging"]["level"]
+    _setup_logging(log_level, cfg["logging"].get("file"))
+
+    logger.info("nvrd %s starting", VERSION)
+    if cfg_path:
+        logger.info("config: %s", cfg_path)
+
+    orch = Orchestrator(cfg)
+
+    if args.check:
+        try:
+            _check_leaf_scripts_in_path()
+            cams = orch.resolve_all(orch.gather_cameras())
+            logger.info("check OK: %d camera(s) resolved", len(cams))
+            return EXIT_OK if cams else EXIT_PROTOCOL
+        except SystemExit as e:
+            logger.error(str(e).removeprefix(f"{PROG}: "))
+            return EXIT_USAGE
+
+    orch.install_signal_handlers()
+    try:
+        return orch.run()
+    except KeyboardInterrupt:
+        logger.info("interrupted")
+        return EXIT_INTERRUPT
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(EXIT_INTERRUPT)
