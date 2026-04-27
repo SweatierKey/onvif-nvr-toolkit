@@ -360,7 +360,7 @@ Wraps `ffmpeg` with the `segment` muxer.
 - `-d SECONDS` / `--duration SECONDS` — segment length in seconds
   (default: 600 = 10 minutes)
 - `-o PATTERN` / `--output PATTERN` — filename pattern with `strftime`
-  placeholders (default: `recording-%Y-%m-%d_%H-%M-%S.mp4`).
+  placeholders (default: `recording-%Y-%m-%d_%H-%M-%S.mkv`).
   **Must contain at least one strftime placeholder**, otherwise
   segments would overwrite each other — exit 1 if missing.
 - `--transport {tcp,udp}` — default `tcp`
@@ -403,7 +403,7 @@ Wraps `ffmpeg` with the `segment` muxer.
 #### Input
 
 - Positional arguments: list of video files, OR
-- Stdin: one path per line (for `ls *.mp4 | footage-merge -o out.mp4`)
+- Stdin: one path per line (for `ls *.mkv | footage-merge -o out.mkv`)
 - Mixing the two modes (positional + real stdin pipe) is rejected with
   a clear message. `/dev/null`, ttys and inherited stdins are not
   considered "stdin input", so cron/systemd usage does not trigger the

@@ -35,7 +35,7 @@ Each leaf script's repo carries its own demo. See the table below for links.
 | [`rtsp-play`](https://github.com/SweatierKey/rtsp-play) | Open an RTSP URL in mpv (preferred) or ffplay, tuned for low latency. |
 | [`rtsp-record`](https://github.com/SweatierKey/rtsp-record) | Record an RTSP URL to disk in fixed-duration segments (no re-encode). |
 | [`footage-merge`](https://github.com/SweatierKey/footage-merge) | Concatenate `rtsp-record` segments into a single playable file. |
-| **this repo** | Hosts `nvrd`, the orchestrator that drives all the above. |
+| **this repo** | Hosts `nvrd`, the orchestrator that drives all the above, and `nvr-kiosk`, a tiny launcher that asks go2rtc for the current stream and exec's `mpv` fullscreen on it (no hard-coded camera URL in your kiosk unit). |
 
 Each leaf repo is **standalone** and useful on its own. The umbrella adds
 nothing to them at runtime — `nvrd` simply expects the six scripts to be in
@@ -51,7 +51,7 @@ can:
 - Replace `go2rtc-gen` with your own generator for a different consumer
   (e.g. a Frigate `config.yml`).
 - Use `rtsp-play` standalone to verify a stream during installation.
-- Call `footage-merge` against arbitrary `mp4` files outside the NVR loop.
+- Call `footage-merge` against arbitrary `mkv`/`mp4` files outside the NVR loop.
 
 The orchestrator (`nvrd`) is a thin layer that wires the same scripts
 together on a schedule. It does not duplicate any of their logic — if a
@@ -65,7 +65,7 @@ The simplest way to record from a camera you already know the IP of:
 ```sh
 onvif-rtsp --user admin --password admin --inject-credentials \
     http://192.168.0.73:8899/onvif/device_service \
-  | rtsp-record -d 600 -o "/srv/footage/cam1-%Y-%m-%d_%H-%M-%S.mp4"
+  | rtsp-record -d 600 -o "/srv/footage/cam1-%Y-%m-%d_%H-%M-%S.mkv"
 ```
 
 End-to-end pipeline (auto-discovery, single camera):
@@ -73,13 +73,13 @@ End-to-end pipeline (auto-discovery, single camera):
 ```sh
 onvif-discover \
   | xargs -I{} onvif-rtsp --user admin --password admin --inject-credentials {} \
-  | rtsp-record -d 600 -o "/srv/footage/%Y-%m-%d_%H-%M-%S.mp4"
+  | rtsp-record -d 600 -o "/srv/footage/%Y-%m-%d_%H-%M-%S.mkv"
 ```
 
 Stitch a day's segments back into one file:
 
 ```sh
-ls /srv/footage/2026-04-26_*.mp4 | footage-merge -o /srv/footage/2026-04-26.mp4
+ls /srv/footage/2026-04-26_*.mkv | footage-merge -o /srv/footage/2026-04-26.mkv
 ```
 
 ## Quick tour (with `nvrd`)
@@ -179,12 +179,48 @@ logging:
   file: ~/.local/state/nvrd.log   # set to null to log only to stdout
 ```
 
-Files end up at `<base_dir>/<cam-name>/<YYYY-MM-DD>/cam-<...>.mp4`. At the
+Files end up at `<base_dir>/<cam-name>/<YYYY-MM-DD>/cam-<...>.mkv`. At the
 configured rotation time `nvrd` stops the day's `rtsp-record`, calls
-`footage-merge` to produce `_merged-<YYYY-MM-DD>.mp4` next to the segments,
+`footage-merge` to produce `_merged-<YYYY-MM-DD>.mkv` next to the segments,
 and starts a fresh `rtsp-record` for the new day.
 
 See `nvrd --help` for command-line options.
+
+## Kiosk display on boot (`nvr-kiosk`)
+
+If the box is plugged into a TV and you want the camera fullscreen as
+soon as it powers on, use `nvr-kiosk`. It asks the local `go2rtc` API
+for the current stream name (so it survives a camera DHCP change or a
+swap to a different camera) and then exec's `mpv` with low-latency,
+fullscreen, looping flags.
+
+A typical user-mode systemd unit (alongside `nvrd.service`):
+
+```ini
+[Unit]
+Description=NVR kiosk display (cage + nvr-kiosk)
+After=nvrd.service
+Wants=nvrd.service
+PartOf=nvrd.service
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+ExecStart=/usr/bin/cage -- %h/.local/bin/nvr-kiosk
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+`cage` is a tiny Wayland kiosk compositor; `nvr-kiosk` does the
+discover-and-play. No camera URL is hard-coded anywhere.
+
+If you have multiple cameras, point `nvr-kiosk --stream <name>` at the
+one you want on screen. `nvr-kiosk --print-url` also exists if you want
+the resolved RTSP URL on stdout (useful for shell scripting).
 
 ## Design constraints (binding for `nvrd` and the leaf scripts)
 
@@ -235,11 +271,13 @@ onvif-nvr-toolkit/
 ├── PROTOCOL.md          # the original spec; binding for new contributions
 ├── LICENSE              # MIT
 ├── nvrd                 # the orchestrator (no .py extension; chmod +x)
+├── nvr-kiosk            # waits for a go2rtc stream then exec's mpv fullscreen
 ├── requirements.txt     # PyYAML
 ├── examples/
 │   └── config.yaml      # annotated reference config for nvrd
 └── tests/
-    └── test_nvrd.py     # offline test suite
+    ├── test_nvrd.py
+    └── test_nvr_kiosk.py
 ```
 
 ## License

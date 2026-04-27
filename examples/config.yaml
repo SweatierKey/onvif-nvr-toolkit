@@ -22,7 +22,7 @@ schedule:
   rotate_at: "00:00"
 
   # If true, the just-finished day's segments are concatenated into
-  # _merged-<YYYY-MM-DD>.mp4 in the same per-day folder. Set to false if
+  # _merged-<YYYY-MM-DD>.mkv in the same per-day folder. Set to false if
   # you only want raw segments and prefer to merge later by hand.
   merge_on_rotate: true
 

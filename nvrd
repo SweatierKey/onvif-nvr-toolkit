@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PROG = "nvrd"
 
 EXIT_OK = 0
@@ -46,8 +46,8 @@ LEAF_SCRIPTS = (
 )
 
 # Tags used in fixed file/folder names. Kept here so tests can reference them.
-SEGMENT_FILENAME_PATTERN = "cam-%Y-%m-%d_%H-%M-%S.mp4"
-MERGED_FILENAME_TEMPLATE = "_merged-{date}.mp4"
+SEGMENT_FILENAME_PATTERN = "cam-%Y-%m-%d_%H-%M-%S.mkv"
+MERGED_FILENAME_TEMPLATE = "_merged-{date}.mkv"
 DATE_FOLDER_FORMAT = "%Y-%m-%d"
 
 
@@ -644,7 +644,7 @@ class CameraWorker(threading.Thread):
 # Filesystem helpers
 # ---------------------------------------------------------------------------
 
-_SEGMENT_RE = re.compile(r"^cam-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.mp4$")
+_SEGMENT_RE = re.compile(r"^cam-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.mkv$")
 
 
 def _segment_files_in(folder: Path) -> List[Path]:

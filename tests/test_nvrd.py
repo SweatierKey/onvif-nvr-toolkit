@@ -93,25 +93,25 @@ class SegmentHelpersTests(unittest.TestCase):
     def test_segment_files_filtered_and_sorted(self):
         with tempfile.TemporaryDirectory() as d:
             dp = Path(d)
-            (dp / "cam-2026-04-26_18-30-01.mp4").write_text("x")
-            (dp / "cam-2026-04-26_18-20-01.mp4").write_text("x")
-            (dp / "_merged-2026-04-26.mp4").write_text("x")  # excluded
+            (dp / "cam-2026-04-26_18-30-01.mkv").write_text("x")
+            (dp / "cam-2026-04-26_18-20-01.mkv").write_text("x")
+            (dp / "_merged-2026-04-26.mkv").write_text("x")  # excluded
             (dp / "notes.txt").write_text("x")               # excluded
             (dp / "subdir").mkdir()                          # excluded
             segs = nvrd._segment_files_in(dp)
             self.assertEqual(
                 [p.name for p in segs],
-                ["cam-2026-04-26_18-20-01.mp4", "cam-2026-04-26_18-30-01.mp4"],
+                ["cam-2026-04-26_18-20-01.mkv", "cam-2026-04-26_18-30-01.mkv"],
             )
 
     def test_latest_segment(self):
         with tempfile.TemporaryDirectory() as d:
             dp = Path(d)
-            (dp / "cam-2026-04-26_18-30-01.mp4").write_text("x")
-            (dp / "cam-2026-04-26_18-40-01.mp4").write_text("x")
+            (dp / "cam-2026-04-26_18-30-01.mkv").write_text("x")
+            (dp / "cam-2026-04-26_18-40-01.mkv").write_text("x")
             self.assertEqual(
                 nvrd._latest_segment(dp).name,
-                "cam-2026-04-26_18-40-01.mp4",
+                "cam-2026-04-26_18-40-01.mkv",
             )
 
     def test_latest_segment_empty(self):
@@ -312,11 +312,11 @@ class MergeSegmentsTests(unittest.TestCase):
     def test_invokes_footage_merge_with_outputs(self):
         with _MockLeavesPath(["footage-merge"]) as mp, \
              tempfile.TemporaryDirectory() as d:
-            inputs = [Path(d) / f"cam-2026-04-26_{i:02d}-00-00.mp4"
+            inputs = [Path(d) / f"cam-2026-04-26_{i:02d}-00-00.mkv"
                       for i in range(1, 3)]
             for p in inputs:
                 p.write_text("x")
-            out = Path(d) / "_merged-2026-04-26.mp4"
+            out = Path(d) / "_merged-2026-04-26.mkv"
             nvrd.merge_segments(inputs, out)
             args = mp.args("footage-merge")
             self.assertIn("-o", args)

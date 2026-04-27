@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""nvr-kiosk — wait for a go2rtc stream to appear, then exec mpv on it
+in fullscreen/loop mode.
+
+Designed for systemd kiosk units (typically wrapped in `cage`) where the
+camera IP — and therefore the stream name — can change between boots.
+The kiosk unit no longer needs a hard-coded RTSP URL: it asks go2rtc.
+
+Stdout: nothing (process exec's into mpv).
+Stderr: short progress + errors.
+
+Exit codes:
+  0   mpv ran (and exited 0; exit code is mpv's)
+  1   usage / setup error (mpv not in PATH, bad flags)
+  2   network error (could not reach go2rtc API after --wait-timeout)
+  4   protocol error (go2rtc reachable but no streams published)
+  130 interrupted (SIGINT)
+"""
+
+import argparse
+import http.client
+import json
+import os
+import shutil
+import signal
+import sys
+import time
+from urllib.parse import urlparse
+
+PROG = "nvr-kiosk"
+VERSION = "1.0.0"
+
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_NETWORK = 2
+EXIT_PROTOCOL = 4
+EXIT_INTERRUPT = 130
+
+
+def err(msg: str) -> None:
+    print(f"{PROG}: {msg}", file=sys.stderr)
+
+
+def log(verbose: bool, msg: str) -> None:
+    if verbose:
+        print(f"{PROG}: {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# go2rtc API polling
+# ---------------------------------------------------------------------------
+
+def fetch_streams(api_url: str, http_timeout: float = 2.0):
+    """Return the list of stream names currently published by go2rtc.
+
+    Raises OSError on transport / HTTP / JSON failure. The /api/streams
+    endpoint returns a JSON object whose keys are stream names; we ignore
+    the values (producer/consumer detail).
+    """
+    u = urlparse(api_url)
+    if u.scheme != "http":
+        raise ValueError("api-url scheme must be http")
+    host = u.hostname or "127.0.0.1"
+    port = u.port or 80
+    conn = http.client.HTTPConnection(host, port, timeout=http_timeout)
+    try:
+        path = (u.path.rstrip("/") + "/api/streams") if u.path and u.path != "/" \
+               else "/api/streams"
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status != 200:
+            raise OSError(f"HTTP {resp.status} from {api_url}")
+        try:
+            data = json.loads(body.decode("utf-8") or "{}")
+        except json.JSONDecodeError as e:
+            raise OSError(f"invalid JSON from go2rtc: {e}")
+        if not isinstance(data, dict):
+            raise OSError("expected JSON object at /api/streams")
+        return list(data.keys())
+    finally:
+        conn.close()
+
+
+def wait_for_stream(api_url, want_name, total_timeout, poll_interval, verbose):
+    """Block until go2rtc lists the wanted stream (or any, if want_name is
+    None). Return the chosen stream name.
+
+    Raises OSError if go2rtc API stays unreachable for total_timeout, or
+    RuntimeError if it is reachable but never publishes a matching stream.
+    """
+    deadline = time.monotonic() + total_timeout
+    last_transport_err = None
+    api_was_reachable = False
+    while True:
+        try:
+            names = fetch_streams(api_url)
+        except (OSError, ValueError) as e:
+            last_transport_err = e
+            log(verbose, f"go2rtc not ready: {e}")
+        else:
+            api_was_reachable = True
+            if want_name:
+                if want_name in names:
+                    return want_name
+                log(verbose, f"waiting for stream '{want_name}'; have {names}")
+            elif names:
+                return names[0]
+            else:
+                log(verbose, "go2rtc up but no streams published yet")
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll_interval)
+    if not api_was_reachable:
+        raise OSError(
+            f"go2rtc API at {api_url} unreachable after {total_timeout:.0f}s: "
+            f"{last_transport_err}"
+        )
+    if want_name:
+        raise RuntimeError(
+            f"go2rtc never published stream '{want_name}' "
+            f"after {total_timeout:.0f}s"
+        )
+    raise RuntimeError(
+        f"go2rtc published no streams after {total_timeout:.0f}s"
+    )
+
+
+# ---------------------------------------------------------------------------
+# mpv argv (kiosk-tuned, low latency)
+# ---------------------------------------------------------------------------
+
+def build_mpv_argv(player_path, rtsp_url, *, fullscreen, loop, no_audio,
+                   transport, verbose):
+    argv = [
+        player_path,
+        "--profile=low-latency",
+        f"--demuxer-lavf-o-add=rtsp_transport={transport}",
+        "--demuxer-lavf-o-add=probesize=32",
+        "--demuxer-lavf-o-add=analyzeduration=0",
+        "--demuxer-lavf-o-add=fflags=+discardcorrupt",
+        "--cache=no",
+        "--framedrop=decoder+vo",
+        "--no-input-default-bindings",
+        "--osc=no",
+        "--osd-level=0",
+    ]
+    if fullscreen:
+        argv.append("--fullscreen")
+    if loop:
+        argv.append("--loop-file=inf")
+    if no_audio:
+        argv.append("--no-audio")
+    if not verbose:
+        argv.append("--really-quiet")
+    argv.append(rtsp_url)
+    return argv
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        prog=PROG, add_help=False,
+        description="Wait for a go2rtc stream and play it fullscreen with mpv.",
+    )
+    p.add_argument("--api-url", default="http://127.0.0.1:1984",
+                   help="go2rtc API base URL (default: %(default)s)")
+    p.add_argument("--rtsp-base", default=None, metavar="URL",
+                   help="RTSP base URL; default derived from --api-url host "
+                        "with port 8554")
+    p.add_argument("--stream", default=None, metavar="NAME",
+                   help="stream name to play (default: first one go2rtc lists)")
+    p.add_argument("--wait-timeout", type=float, default=120.0, metavar="SECONDS",
+                   help="seconds to wait for a stream to appear (default: 120)")
+    p.add_argument("--poll-interval", type=float, default=1.0, metavar="SECONDS",
+                   help="go2rtc API poll interval (default: 1.0)")
+    p.add_argument("--transport", choices=["tcp", "udp"], default="tcp",
+                   help="RTSP transport (default: tcp)")
+    p.add_argument("--fullscreen", dest="fullscreen", action="store_true",
+                   default=True, help="fullscreen mpv (default)")
+    p.add_argument("--no-fullscreen", dest="fullscreen", action="store_false",
+                   help="windowed mpv")
+    p.add_argument("--loop", dest="loop", action="store_true", default=True,
+                   help="loop the stream (default; mpv reconnects on EOF)")
+    p.add_argument("--no-loop", dest="loop", action="store_false")
+    p.add_argument("--no-audio", dest="no_audio", action="store_true",
+                   default=True, help="mute audio (default)")
+    p.add_argument("--audio", dest="no_audio", action="store_false")
+    p.add_argument("--print-url", action="store_true",
+                   help="print the resolved RTSP URL on stdout and exit 0; "
+                        "do not exec mpv")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="log progress; let mpv print on stderr too")
+    p.add_argument("-V", "--version", action="version",
+                   version=f"{PROG} {VERSION}")
+    p.add_argument("-h", "--help", action="help")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+
+    if args.poll_interval <= 0 or args.wait_timeout <= 0:
+        err("wait-timeout and poll-interval must be > 0")
+        return EXIT_USAGE
+
+    rtsp_base = args.rtsp_base
+    if rtsp_base is None:
+        u = urlparse(args.api_url)
+        host = u.hostname or "127.0.0.1"
+        rtsp_base = f"rtsp://{host}:8554"
+
+    try:
+        name = wait_for_stream(
+            args.api_url, args.stream, args.wait_timeout,
+            args.poll_interval, args.verbose,
+        )
+    except OSError as e:
+        err(str(e))
+        return EXIT_NETWORK
+    except RuntimeError as e:
+        err(str(e))
+        return EXIT_PROTOCOL
+
+    rtsp_url = f"{rtsp_base.rstrip('/')}/{name}"
+
+    if args.print_url:
+        print(rtsp_url)
+        return EXIT_OK
+
+    player_path = shutil.which("mpv")
+    if not player_path:
+        err("mpv not found in PATH")
+        return EXIT_USAGE
+
+    cmd = build_mpv_argv(
+        player_path, rtsp_url,
+        fullscreen=args.fullscreen, loop=args.loop, no_audio=args.no_audio,
+        transport=args.transport, verbose=args.verbose,
+    )
+    log(args.verbose, "exec: " + " ".join(cmd))
+    # Forward SIGTERM/SIGINT semantics to mpv via execv (we replace ourselves).
+    os.execv(player_path, cmd)
+    # Unreachable; execv either succeeds (no return) or raises OSError.
+    return EXIT_USAGE  # pragma: no cover
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main() or 0)
+    except KeyboardInterrupt:
+        sys.exit(EXIT_INTERRUPT)
