@@ -59,6 +59,11 @@ discovery:
 
 auth:
   # Default credentials, used unless overridden per-camera.
+  #
+  # SECURITY: nvrd passes these to onvif-rtsp via the ONVIF_USER /
+  # ONVIF_PASSWORD environment variables (not via CLI args), so they
+  # don't appear in `ps -ef` or /proc/<pid>/cmdline. They DO live in
+  # this file, though — keep it 0600 (nvrd warns at startup if it isn't).
   user: admin
   password: admin
 
@@ -66,6 +71,8 @@ auth:
   inject_credentials: true
 
   # Per-request HTTP timeout for the SOAP calls onvif-rtsp makes.
+  # Distinct from discovery.timeout (WS-Discovery probe window) and
+  # proxy.ready_timeout (how long to wait for go2rtc to come up).
   timeout: 10
 
 # How nvrd routes the camera streams.
@@ -110,10 +117,19 @@ playback:
 # nvrd checks every `interval` seconds that the segment file currently
 # being written is growing. If it hasn't grown after `stale_grace`
 # seconds, that camera's rtsp-record is restarted.
+#
+# restart_backoff_initial / restart_backoff_max apply to rtsp-record
+# crash loops: after a process exits, nvrd waits N seconds before
+# respawning, doubling each consecutive failure up to the cap. A run
+# that survives at least 60s resets the counter. Without backoff a
+# permanently-broken cam (wrong codec, bad creds) would be hammered
+# every monitor.interval forever.
 monitor:
   interval: 30
   verify_recording: true
   stale_grace: 60
+  restart_backoff_initial: 5
+  restart_backoff_max: 60
 
 logging:
   # info | debug | warning | error

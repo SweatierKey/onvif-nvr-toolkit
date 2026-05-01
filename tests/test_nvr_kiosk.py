@@ -12,6 +12,7 @@ on stdout instead of execing).
 
 import http.server
 import importlib.util
+import os
 import socket
 import subprocess
 import sys
@@ -232,6 +233,35 @@ class CliPrintUrlTests(unittest.TestCase):
                       "--poll-interval", "0.05", "--print-url"])
             self.assertEqual(r.returncode, 4)
             self.assertIn("no streams", r.stderr)
+
+
+class CliExecErrorTests(unittest.TestCase):
+    """If mpv exists in PATH but exec'ing it raises OSError (bad shebang,
+    not executable, ENOEXEC), we should print a one-line error and exit 1
+    — never let a Python traceback escape into the kiosk display."""
+
+    def test_bad_shebang_yields_clean_error(self):
+        import tempfile
+        with _FakeGo2rtc(body=b'{"cam-x": {}}') as g, \
+             tempfile.TemporaryDirectory() as d:
+            # An mpv that is executable but whose shebang interpreter does not
+            # exist — the kernel raises ENOENT, Python turns it into OSError.
+            # (This is the failure mode of e.g. a wrong-architecture binary or
+            # a half-installed mpv package.)
+            mpv_path = os.path.join(d, "mpv")
+            with open(mpv_path, "w") as f:
+                f.write("#!/no/such/interpreter-xyz\n")
+            os.chmod(mpv_path, 0o755)
+            env = dict(os.environ)
+            env["PATH"] = d  # only this fake mpv visible
+            r = _run(["--api-url", g.url(),
+                      "--rtsp-base", "rtsp://127.0.0.1:8554",
+                      "--wait-timeout", "2", "--poll-interval", "0.1"],
+                     env=env)
+            self.assertEqual(r.returncode, 1, msg=r.stdout + r.stderr)
+            self.assertIn("failed to exec", r.stderr)
+            # No Python traceback in the output.
+            self.assertNotIn("Traceback", r.stderr)
 
 
 class MetaTests(unittest.TestCase):

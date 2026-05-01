@@ -129,9 +129,14 @@ pip install --user PyYAML  # or: apt install python3-yaml
 # 5. write a config
 mkdir -p ~/.config/onvif-nvr
 cp examples/config.yaml ~/.config/onvif-nvr/config.yaml
+chmod 600 ~/.config/onvif-nvr/config.yaml   # contains the camera password
 $EDITOR ~/.config/onvif-nvr/config.yaml
 
-# 6. run
+# 6. dry-run: validates config + dependencies + camera resolution,
+# exits without recording. Always do this first.
+nvrd --check
+
+# 7. run
 nvrd
 ```
 
@@ -184,6 +189,15 @@ configured rotation time `nvrd` stops the day's `rtsp-record`, calls
 `footage-merge` to produce `_merged-<YYYY-MM-DD>.mkv` next to the segments,
 and starts a fresh `rtsp-record` for the new day.
 
+The day folder name comes from `_dt.date.today()` at the moment the new
+recording starts (i.e. just after the rotation tick). With the default
+`rotate_at: "00:00"` that's intuitive: each folder holds one calendar
+day's segments. **If you set `rotate_at` to anything else** (e.g.
+`"03:00"` to push the merge work to the small hours), be aware that the
+folder named `2026-04-27` then contains segments from 03:00 of that day
+through 02:59 of `2026-04-28`. Filenames keep their wall-clock
+timestamps either way.
+
 See `nvrd --help` for command-line options.
 
 ## Kiosk display on boot (`nvr-kiosk`)
@@ -221,6 +235,65 @@ discover-and-play. No camera URL is hard-coded anywhere.
 If you have multiple cameras, point `nvr-kiosk --stream <name>` at the
 one you want on screen. `nvr-kiosk --print-url` also exists if you want
 the resolved RTSP URL on stdout (useful for shell scripting).
+
+## Troubleshooting
+
+**`onvif-discover` finds nothing on the LAN.**
+- WS-Discovery uses UDP multicast (group `239.255.255.250`, port `3702`).
+  Some routers / WiFi APs / WSL2 mirrored networking drop multicast
+  silently. Test from a wired box first.
+- Verify the cam is on the same subnet (multicast is link-local).
+- Some cheap firmwares only respond to the second or third probe;
+  `onvif-discover` 1.1.0+ already retransmits 3× — bump `--timeout` to
+  10 if your network is slow.
+
+**`onvif-rtsp` returns `wsse:Security must be understood…` or HTTP 401.**
+- 401: wrong credentials (verify with the camera's web UI).
+- "must be understood": should be fixed since `onvif-rtsp` 1.0; if you
+  see it, the camera is replying to its own absent WS-Security handler —
+  open an issue.
+
+**`rtsp-record` keeps exiting with rc=4 and you get 0-byte files.**
+- The cam's audio codec is incompatible with the chosen container.
+  `nvrd` defaults to `.mkv` (Matroska) since 1.2.0 specifically because
+  PCM µ-law audio (common on cheap ONVIF cams) cannot be muxed into MP4.
+  If you have older `.mp4` segments lying around from a previous nvrd
+  version, they are unrelated — just delete them.
+- Run `rtsp-record -v rtsp://...` by hand to see ffmpeg's actual error.
+  As of `nvrd` 1.3.0, ffmpeg's stderr is forwarded to nvrd's log
+  automatically (look for `[cam-X] rtsp-record:` lines).
+
+**`nvrd` loops "rtsp-record exited; restarting" forever.**
+- Means a permanent failure. Check the last `[cam-X] rtsp-record:` lines
+  in nvrd's log for the actual ffmpeg complaint.
+- `nvrd` 1.3.0+ applies exponential backoff per cam (5s → 10s → … →
+  60s) so the cam isn't hammered. Earlier versions retried every 30s
+  forever.
+
+**`go2rtc API not ready`.**
+- Either go2rtc isn't in PATH (set `proxy.mode: direct` in config to
+  skip it) or the configured `proxy.bind`/`proxy.api_port` is firewalled.
+- Default bind is `127.0.0.1:1984` — should always work locally; if
+  you've changed it, verify with `curl http://<bind>:<api_port>/api/streams`.
+
+**Kiosk shows a black screen.**
+- Run `cage -- mpv test.mkv` by hand to verify cage can grab the
+  display (DRM/KMS or Wayland session).
+- Check the journal: `journalctl --user -u nvr-kiosk.service`.
+- `nvr-kiosk` 1.1.0+ catches `OSError` from `os.execv` and prints a
+  one-line error if mpv can't be exec'd (wrong arch, bad shebang).
+
+**Cam changes IP mid-day and recordings stop.**
+- `nvrd` 1.3.0+ re-resolves cam URLs via `onvif-rtsp` whenever go2rtc
+  dies, so a brief network blip recovers automatically. A *permanent*
+  IP change with `discovery.mode: auto` will create a new cam folder
+  (the cam name is derived from the IP). Use `discovery.mode: static`
+  with explicit `name:` entries for production deployments where you
+  want stable folders across IP churn.
+
+**Config file group/world-readable warning at startup.**
+- Your `config.yaml` is mode 644 (or worse). It contains the camera
+  password. `chmod 600 ~/.config/onvif-nvr/config.yaml`.
 
 ## Design constraints (binding for `nvrd` and the leaf scripts)
 

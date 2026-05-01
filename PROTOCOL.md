@@ -170,10 +170,20 @@ out.
 
 #### Flags
 
-- `--user USER` — ONVIF username (default: empty = no auth)
-- `--password PASSWORD` — ONVIF password (default: empty)
+- `--user USER` — ONVIF username (default: empty = no auth). Falls back to
+  `$ONVIF_USER` if unset.
+- `--password PASSWORD` — ONVIF password (default: empty). Falls back to
+  `$ONVIF_PASSWORD` if unset. **Prefer the env vars** in scripts and
+  systemd units: argv ends up in `/proc/<pid>/cmdline` and `ps -ef`,
+  while child env doesn't.
 - `--inject-credentials` — opt-in: prepend URL-encoded `user:password@`
-  to the returned RTSP URL. Requires `--user`/`--password`.
+  to the returned RTSP URL. Requires credentials (CLI or env).
+- `--profile-index N` — zero-based index of the media profile to query
+  (default 0; conventionally the main stream).
+- `--profile-name NAME` — match a profile by its `Name` (e.g.
+  `MainStream`) or by its token. Wins over `--profile-index`.
+- `--list-profiles` — print `TOKEN<TAB>NAME` per line and exit; does not
+  call `GetStreamUri`. Output goes to stdout (or `-o FILE`).
 - `-o FILE` / `--output FILE` — write to FILE instead of stdout
 - `-t SECONDS` / `--timeout SECONDS` — per-HTTP-request timeout
   (default: 10.0)
@@ -182,7 +192,10 @@ out.
 - `-h` / `--help`
 
 Validation:
-- `--user` without `--password` (or vice versa): exit 1, clear message.
+- `--user`/`ONVIF_USER` without password (or vice versa): exit 1.
+- `--profile-index` < 0: exit 1.
+- `--profile-index` past the last profile: exit 4 with a list of what
+  the device DID return.
 - URL not starting with `http://` or `https://`: exit 1.
 
 #### SOAP sequence
@@ -192,16 +205,19 @@ Validation:
    URL (usually different from the device service, e.g.
    `http://192.168.1.64/onvif/Media`).
 
-2. **`GetProfiles`** on the media service. Extract the `token` of the
-   FIRST profile returned (`token` attribute of `trt:Profiles`). By ONVIF
-   convention the first profile is the main stream — we don't choose, we
-   take what the device gives us.
+2. **`GetProfiles`** on the media service. Build the list of
+   `(token, name)` tuples in device order. With `--list-profiles`,
+   print them and stop.
 
 3. **`GetStreamUri`** on the media service with:
    - `StreamSetup/Stream = RTP-Unicast`
    - `StreamSetup/Transport/Protocol = RTSP`
-   - `ProfileToken = <token from step 2>`
+   - `ProfileToken = <selected profile token>`
    Extract `tt:Uri`. That's the RTSP URL we print.
+
+   The selected token comes from `--profile-name` if set, else from
+   `--profile-index` (default 0). Most cameras put the main stream at
+   index 0 and the sub-stream at index 1.
 
 The only thing on stdout is the RTSP URL, followed by a newline.
 
@@ -449,3 +465,45 @@ The orchestrator binds itself to the same conventions as the leaf
 scripts (stderr for logs, GNU flags, exit codes, predictable failures).
 It does not duplicate any logic — it just shells out to the leaf
 scripts that must exist in `PATH`.
+
+### Credentials handling (binding for `nvrd` and onvif-rtsp)
+
+`onvif-rtsp` accepts ONVIF credentials via either CLI flags
+(`--user`, `--password`) **or** environment variables (`ONVIF_USER`,
+`ONVIF_PASSWORD`); the CLI flag wins when both are set.
+
+`nvrd` MUST pass credentials via the env vars when spawning `onvif-rtsp`,
+never via CLI flags. The reason is that `/proc/<pid>/cmdline` is readable
+by every local user, while a child's environment is not (modes
+0700/0500 since Linux 2.6.39). Putting the password in argv would expose
+it through `ps -ef` and any `auditd`/`sysdig` rule that records argv.
+
+Internally, `nvrd` also redacts userinfo from any URL it logs at
+DEBUG/INFO (`rtsp://u:p@host` → `rtsp://***@host`) so a long-lived log
+file never persists the password in cleartext.
+
+### `nvr-kiosk` (deployment helper)
+
+Also shipped with this repo, also not part of the data pipeline.
+`nvr-kiosk` is a small launcher for kiosk-style displays: it polls the
+local go2rtc API (`/api/streams`) until at least one stream is
+published, then exec's `mpv` with low-latency / fullscreen / loop /
+no-audio flags. Designed to be wrapped in `cage` (a Wayland kiosk
+compositor) and run as a user-mode systemd unit.
+
+It exists because hard-coding an `rtsp://...` URL in a kiosk unit
+breaks the moment the camera changes IP. `nvr-kiosk` asks go2rtc what
+the current stream name is, so the discovery indirection that `nvrd`
+maintains also benefits the on-screen output.
+
+It binds itself to the same conventions as the leaf scripts (stderr
+logs, GNU flags, documented exit codes, no tracebacks for predictable
+failures). Exit codes specific to `nvr-kiosk`:
+
+- `0` `mpv` ran (and exited 0)
+- `1` usage error / `mpv` failed to exec
+- `2` go2rtc API unreachable for the wait window
+- `4` go2rtc reachable but published no matching stream
+
+`--print-url` prints the resolved RTSP URL on stdout (without exec'ing
+mpv), so other tools can reuse the discovery.

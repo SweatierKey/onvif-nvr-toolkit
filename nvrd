@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROG = "nvrd"
 
 EXIT_OK = 0
@@ -84,54 +84,86 @@ def _setup_logging(level_name: str, file_path: Optional[str]) -> None:
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "storage": {"base_dir": "/srv/footage"},
-    "schedule": {
-        "segment_duration": 600,
-        "rotate_at": "00:00",
-        "merge_on_rotate": True,
-        "delete_segments_after_merge": False,
-    },
-    "discovery": {
-        "mode": "auto",
-        "timeout": 5,
-        "cameras": [],
-    },
-    "auth": {
-        "user": "",
-        "password": "",
-        "inject_credentials": True,
-        "timeout": 10,
-    },
-    "proxy": {
-        # proxy: nvrd starts go2rtc and routes record/play through it.
-        # direct: record/play hit the camera directly (no go2rtc needed).
-        "mode": "proxy",
-        # Where go2rtc binds. Default is loopback-only — bump to 0.0.0.0
-        # if you want Frigate / Home Assistant on another host to tap in.
-        "bind": "127.0.0.1",
-        "rtsp_port": 8554,
-        "api_port": 1984,
-        # How long to wait (seconds) for the go2rtc API to come online
-        # after we start it.
-        "ready_timeout": 15,
-    },
-    "playback": {
-        "enabled": False,
-        "player": "auto",
-        "transport": "tcp",
-        "no_audio": True,
-    },
-    "monitor": {
-        "interval": 30,
-        "verify_recording": True,
-        "stale_grace": 60,
-    },
-    "logging": {
-        "level": "info",
-        "file": None,
-    },
-}
+# `_default_config()` builds a fresh dict on every call. Keeping it a function
+# (rather than a module-level dict) means an importing test or downstream tool
+# can't mutate it and contaminate every subsequent load_config().
+def _default_config() -> Dict[str, Any]:
+    return {
+        "storage": {"base_dir": "/srv/footage"},
+        "schedule": {
+            "segment_duration": 600,
+            "rotate_at": "00:00",
+            "merge_on_rotate": True,
+            "delete_segments_after_merge": False,
+        },
+        "discovery": {
+            "mode": "auto",
+            "timeout": 5,
+            "cameras": [],
+        },
+        "auth": {
+            "user": "",
+            "password": "",
+            "inject_credentials": True,
+            "timeout": 10,
+        },
+        "proxy": {
+            # proxy: nvrd starts go2rtc and routes record/play through it.
+            # direct: record/play hit the camera directly (no go2rtc needed).
+            "mode": "proxy",
+            # Where go2rtc binds. Default is loopback-only — bump to 0.0.0.0
+            # if you want Frigate / Home Assistant on another host to tap in.
+            "bind": "127.0.0.1",
+            "rtsp_port": 8554,
+            "api_port": 1984,
+            # How long to wait (seconds) for the go2rtc API to come online
+            # after we start it.
+            "ready_timeout": 15,
+        },
+        "playback": {
+            "enabled": False,
+            "player": "auto",
+            "transport": "tcp",
+            "no_audio": True,
+        },
+        "monitor": {
+            "interval": 30,
+            "verify_recording": True,
+            "stale_grace": 60,
+            # Restart-loop backoff: after a rtsp-record exit we wait
+            # `restart_backoff_initial` seconds before respawning, doubling
+            # each consecutive failure up to `restart_backoff_max`. A clean
+            # run that produces at least one segment resets it. Without this,
+            # a permanently-broken cam (e.g. wrong codec, bad creds) makes
+            # nvrd hammer the camera every ~30 s indefinitely.
+            "restart_backoff_initial": 5,
+            "restart_backoff_max": 60,
+        },
+        "logging": {
+            "level": "info",
+            "file": None,
+        },
+    }
+
+
+# Backwards-compat shim for tests / downstream code that import the constant.
+DEFAULT_CONFIG: Dict[str, Any] = _default_config()
+
+
+# Matches the userinfo (user[:pass]) part of an RTSP/HTTP/HTTPS URL.
+_USERINFO_RE = re.compile(r"(?P<scheme>\b(?:rtsp|rtsps|http|https)://)[^/@\s]+@")
+
+
+def _redact_url(s: str) -> str:
+    """Replace userinfo in URLs with `***` for safe logging.
+
+    `rtsp://admin:hunter2@192.168.1.4/stream` → `rtsp://***@192.168.1.4/stream`
+
+    Used everywhere we might emit a URL we got from `onvif-rtsp` (which can
+    embed credentials when --inject-credentials is on). Without this, a
+    DEBUG-level log file would persist passwords forever.
+    """
+    return _USERINFO_RE.sub(r"\g<scheme>***@", s)
 
 
 GO2RTC_INSTALL_HINT = (
@@ -153,8 +185,13 @@ def _deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_config(path: Optional[str]) -> Dict[str, Any]:
     """Load a YAML config from `path`, merge over the defaults. If path is
-    None, returns just the defaults — useful for `--auto` no-config mode."""
-    cfg = _clone(DEFAULT_CONFIG)
+    None, returns just the defaults — useful for `--auto` no-config mode.
+
+    Also warns on stderr if the file is world-/group-readable: the config
+    typically contains `auth.password`, and a 644 file means any local user
+    can read the camera credentials.
+    """
+    cfg = _default_config()
     if not path:
         return cfg
     try:
@@ -166,6 +203,7 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
     p = Path(os.path.expanduser(path))
     if not p.is_file():
         raise SystemExit(f"{PROG}: config file not found: {path}")
+    _warn_if_config_world_readable(p)
     with open(p, "r", encoding="utf-8") as f:
         loaded = yaml.safe_load(f) or {}
     if not isinstance(loaded, dict):
@@ -175,12 +213,28 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
     return cfg
 
 
-def _clone(d: Any) -> Any:
-    if isinstance(d, dict):
-        return {k: _clone(v) for k, v in d.items()}
-    if isinstance(d, list):
-        return [_clone(x) for x in d]
-    return d
+def _warn_if_config_world_readable(p: Path) -> None:
+    """Print a stderr warning if the config file's permission bits include
+    any world or group access. Typical safe mode is 0600.
+
+    On non-POSIX filesystems (e.g. CIFS-mounted, FAT) the mode bits are
+    meaningless, so we silently skip rather than nag the user uselessly.
+    """
+    try:
+        st = os.stat(p)
+    except OSError:
+        return
+    # Skip the warning when the host filesystem doesn't carry meaningful
+    # POSIX modes (mode 0 means none of these bits make sense).
+    if st.st_mode & 0o777 == 0:
+        return
+    if st.st_mode & 0o077:
+        print(
+            f"{PROG}: WARNING: {p} is group/world-readable (mode "
+            f"{st.st_mode & 0o777:#o}); it likely contains credentials. "
+            f"Run: chmod 600 {p}",
+            file=sys.stderr,
+        )
 
 
 def _validate_config(cfg: Dict[str, Any]) -> None:
@@ -276,7 +330,13 @@ def render_go2rtc_yaml(cams: List[Camera], bind: str,
 
 
 class Go2rtcSupervisor:
-    """Spawns and monitors a single `go2rtc -config <file>` subprocess."""
+    """Spawns and monitors a single `go2rtc -config <file>` subprocess.
+
+    Cams are replaceable via `set_cams()` so the orchestrator can re-resolve
+    URLs (e.g. after a camera DHCP change) and then call `restart()` to pick
+    them up — without that, a `restart()` after a network blip would just
+    re-launch go2rtc against the same stale URLs in a loop of death.
+    """
 
     def __init__(self, cams: List[Camera], cfg: Dict[str, Any]):
         self.cams = cams
@@ -284,6 +344,10 @@ class Go2rtcSupervisor:
         self.proc: Optional[subprocess.Popen] = None
         self._tmp_path: Optional[str] = None
         self._lock = threading.Lock()
+
+    def set_cams(self, cams: List[Camera]) -> None:
+        """Replace the cam list used on the next start()/restart()."""
+        self.cams = cams
 
     def local_url_for(self, cam: Camera) -> str:
         return f"rtsp://{self.cfg['bind']}:{self.cfg['rtsp_port']}/{cam.name}"
@@ -299,9 +363,18 @@ class Go2rtcSupervisor:
             prefix="nvrd-go2rtc-", delete=False,
         )
         f.write(yaml_text); f.close()
+        # mkstemp (used internally by NamedTemporaryFile) opens with mode
+        # 0600. Re-assert it explicitly in case the umask was permissive.
+        try:
+            os.chmod(f.name, 0o600)
+        except OSError:
+            pass
         self._tmp_path = f.name
         logger.info("starting go2rtc (config: %s)", self._tmp_path)
-        logger.debug("go2rtc.yaml:\n%s", yaml_text)
+        # The YAML body contains the cameras' RTSP URLs which carry creds
+        # when --inject-credentials is on. Redact before logging — DEBUG
+        # output often ends up in long-lived log files / journald.
+        logger.debug("go2rtc.yaml:\n%s", _redact_url(yaml_text))
         self.proc = subprocess.Popen(
             ["go2rtc", "-config", self._tmp_path],
             stdin=subprocess.DEVNULL,
@@ -400,17 +473,29 @@ def discover_devices(timeout: int) -> List[str]:
 
 
 def resolve_rtsp_url(cam: Camera, timeout: int) -> str:
-    """Call onvif-rtsp to resolve the RTSP URL for a camera. Returns the URL.
-    Always uses --inject-credentials when credentials are present, because the
-    URL we hand to ffmpeg/mpv has to be self-contained."""
+    """Call onvif-rtsp to resolve the RTSP URL for a camera.
+
+    Credentials are passed through ONVIF_USER/ONVIF_PASSWORD env vars rather
+    than --user/--password CLI flags, so they don't appear in
+    `/proc/<pid>/cmdline` (visible to any local user via `ps`/`/proc`).
+    `onvif-rtsp` 1.1.0+ reads the env vars when no CLI flag is set.
+    """
     cmd = ["onvif-rtsp", "-t", str(timeout)]
+    env = dict(os.environ)
     if cam.user:
-        cmd += ["--user", cam.user, "--password", cam.password]
+        env["ONVIF_USER"] = cam.user
+        env["ONVIF_PASSWORD"] = cam.password
         if cam.inject_credentials:
             cmd.append("--inject-credentials")
+    else:
+        # Make sure we don't accidentally inherit creds from an outer env
+        # (e.g. left over from a previous cam in the loop).
+        env.pop("ONVIF_USER", None)
+        env.pop("ONVIF_PASSWORD", None)
     cmd.append(cam.device_url)
     logger.debug("resolving rtsp for %s", cam.name)
-    cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+    cp = subprocess.run(cmd, capture_output=True, text=True,
+                        timeout=timeout + 10, env=env)
     if cp.returncode != 0:
         raise RuntimeError(
             f"onvif-rtsp failed for {cam.name}: rc={cp.returncode} {cp.stderr.strip()}"
@@ -457,6 +542,12 @@ class CameraWorker(threading.Thread):
         self.play_proc: Optional[subprocess.Popen] = None
         self._current_day: Optional[str] = None
         self._current_dir: Optional[Path] = None
+        self._record_stderr_thread: Optional[threading.Thread] = None
+        # Restart backoff: tracks consecutive rtsp-record failures so we
+        # don't hammer a permanently-broken cam every monitor.interval.
+        self._consecutive_failures = 0
+        self._next_restart_at = 0.0
+        self._record_started_at = 0.0
         # _stop_subprocesses is called both by Orchestrator.run() in its
         # finally and by the worker's own thread on exit. Serialize so we
         # only log/SIGINT once.
@@ -484,6 +575,11 @@ class CameraWorker(threading.Thread):
             interval = self.cfg["monitor"]["interval"]
             verify = self.cfg["monitor"]["verify_recording"]
             grace = self.cfg["monitor"]["stale_grace"]
+            backoff_initial = self.cfg["monitor"].get("restart_backoff_initial", 5)
+            backoff_max = self.cfg["monitor"].get("restart_backoff_max", 60)
+            # If a record process survives this long without dying we treat
+            # it as "things work" and wipe the consecutive-failures counter.
+            STABLE_AFTER = 60.0
             last_size = -1
             last_change = time.monotonic()
 
@@ -493,10 +589,36 @@ class CameraWorker(threading.Thread):
                     self._do_rotation()
                     last_size = -1; last_change = time.monotonic()
 
+                # Successfully ran for a while → reset the failure counter so
+                # a transient blip later doesn't immediately get exponential
+                # treatment.
+                if (self.record_proc and self.record_proc.poll() is None
+                        and self._consecutive_failures > 0
+                        and time.monotonic() - self._record_started_at > STABLE_AFTER):
+                    self._consecutive_failures = 0
+                    self._next_restart_at = 0.0
+
                 if self.record_proc and self.record_proc.poll() is not None:
                     rc = self.record_proc.returncode
-                    logger.warning("[%s] rtsp-record exited (rc=%s); restarting",
-                                   self.cam.name, rc)
+                    self._consecutive_failures += 1
+                    backoff = min(
+                        backoff_initial * (2 ** (self._consecutive_failures - 1)),
+                        backoff_max,
+                    )
+                    self._next_restart_at = time.monotonic() + backoff
+                    logger.warning(
+                        "[%s] rtsp-record exited (rc=%s, fail=%d); "
+                        "restarting in %ds",
+                        self.cam.name, rc, self._consecutive_failures, backoff,
+                    )
+                    # Drain stderr reader before respawning.
+                    if self._record_stderr_thread:
+                        self._record_stderr_thread.join(timeout=2)
+                        self._record_stderr_thread = None
+                    self.record_proc = None
+                # Honour the backoff: don't respawn until next_restart_at.
+                if (self.record_proc is None
+                        and time.monotonic() >= self._next_restart_at):
                     self._start_recording_for_today()
                     last_size = -1; last_change = time.monotonic()
 
@@ -506,7 +628,7 @@ class CameraWorker(threading.Thread):
                                    self.cam.name, self.play_proc.returncode)
                     self._start_playback()
 
-                if verify and self._current_dir:
+                if verify and self._current_dir and self.record_proc:
                     cur = _latest_segment(self._current_dir)
                     if cur is not None:
                         size = cur.stat().st_size
@@ -544,16 +666,28 @@ class CameraWorker(threading.Thread):
         pattern = str(day_dir / SEGMENT_FILENAME_PATTERN)
         cmd = [
             "rtsp-record",
+            "-v",  # need verbose so it forwards ffmpeg's stderr through to us
             "-d", str(self.cfg["schedule"]["segment_duration"]),
             "-o", pattern,
             self.cam.rtsp_url or "",
         ]
         logger.info("[%s] starting rtsp-record into %s", self.cam.name, day_dir)
-        logger.debug("[%s] exec: %s", self.cam.name, " ".join(shlex.quote(x) for x in cmd))
+        # Redact creds in case proxy.mode is "direct" (URL hits the cam
+        # directly with embedded user:pass).
+        logger.debug("[%s] exec: %s", self.cam.name,
+                     _redact_url(" ".join(shlex.quote(x) for x in cmd)))
         self.record_proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            bufsize=1, universal_newlines=True,
         )
+        self._record_started_at = time.monotonic()
+        self._record_stderr_thread = threading.Thread(
+            target=_pipe_stderr_to_logger,
+            args=(self.record_proc, f"[{self.cam.name}] rtsp-record"),
+            daemon=True,
+        )
+        self._record_stderr_thread.start()
 
     def _restart_recording(self) -> None:
         if self.record_proc and self.record_proc.poll() is None:
@@ -563,6 +697,9 @@ class CameraWorker(threading.Thread):
             except subprocess.TimeoutExpired:
                 self.record_proc.kill()
                 self.record_proc.wait()
+        if self._record_stderr_thread:
+            self._record_stderr_thread.join(timeout=2)
+            self._record_stderr_thread = None
         self._start_recording_for_today()
 
     def _start_playback(self) -> None:
@@ -594,6 +731,9 @@ class CameraWorker(threading.Thread):
                                self.cam.name)
                 self.record_proc.kill()
                 self.record_proc.wait()
+        if self._record_stderr_thread:
+            self._record_stderr_thread.join(timeout=2)
+            self._record_stderr_thread = None
         self._start_recording_for_today()
 
         if self.cfg["schedule"]["merge_on_rotate"] and previous_dir and previous_day:
@@ -636,8 +776,46 @@ class CameraWorker(threading.Thread):
                                        self.cam.name, label)
                         proc.kill()
                         proc.wait()
+            if self._record_stderr_thread:
+                self._record_stderr_thread.join(timeout=2)
+                self._record_stderr_thread = None
             self.record_proc = None
             self.play_proc = None
+
+
+# ---------------------------------------------------------------------------
+# Subprocess stderr → logger plumbing
+# ---------------------------------------------------------------------------
+
+def _pipe_stderr_to_logger(proc: subprocess.Popen, prefix: str,
+                           level: int = logging.WARNING) -> None:
+    """Forward each line from `proc.stderr` to the nvrd logger with `prefix`.
+
+    Without this, all of rtsp-record's diagnostic output (and ffmpeg's behind
+    it) is silently dropped on the floor — a permanent fail (auth, codec,
+    bad URL) shows up only as 'rtsp-record exited (rc=4)' in nvrd's log,
+    forcing you to rerun the command by hand to find out why.
+    """
+    if proc.stderr is None:
+        return
+    try:
+        for raw in proc.stderr:
+            line = raw.rstrip()
+            if not line:
+                continue
+            # Some lines are noisy progress (e.g. ffmpeg's frame= bitrate=);
+            # log them at INFO so users can grep them out, errors at WARNING.
+            # Heuristic: if the line carries an obvious failure marker, lift
+            # it to WARNING; otherwise INFO is enough.
+            line_low = line.lower()
+            if ("error" in line_low or "fail" in line_low
+                    or "denied" in line_low or "unauthorized" in line_low):
+                logger.warning("%s: %s", prefix, line)
+            else:
+                logger.info("%s: %s", prefix, line)
+    except (OSError, ValueError):
+        # Pipe closed mid-read — process exited. Nothing more to do.
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +847,13 @@ def parse_rotate_at(text: str) -> Tuple[int, int]:
 
 
 def next_rotation_after(now: _dt.datetime, hour: int, minute: int) -> _dt.datetime:
+    """Return the next datetime at HH:MM after `now`.
+
+    `now` is naive local time. On DST transition days the duration to the
+    next rotation can be ±1 hour off, but the wall-clock time is honoured
+    (which is what users want — "rotate at midnight" should rotate at
+    whatever the wall clock calls midnight).
+    """
     candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if candidate <= now:
         candidate += _dt.timedelta(days=1)
@@ -731,12 +916,43 @@ class Orchestrator:
             ))
         return cams
 
+    def _resupervise(self, supervisor: "Go2rtcSupervisor",
+                     cams: List[Camera]) -> None:
+        """Re-resolve the RTSP URL for every cam and bounce go2rtc with the
+        fresh config.
+
+        Workers keep using their stable `rtsp://127.0.0.1:8554/<cam-name>`
+        URL — only what go2rtc points UPSTREAM gets refreshed. Resolution
+        runs against `cam.device_url` (the ONVIF service URL we discovered
+        at startup) which doesn't move when the media URL behind it does.
+        """
+        proxy_cams = []
+        for cam in cams:
+            try:
+                fresh = resolve_rtsp_url(cam, self.cfg["auth"]["timeout"])
+                logger.info("[%s] re-resolved -> %s",
+                            cam.name, _redact_url(fresh))
+                proxy_cams.append(dataclasses.replace(cam, rtsp_url=fresh))
+            except Exception as e:
+                logger.error("[%s] re-resolve failed: %s; "
+                             "go2rtc will keep its previous URL for this cam",
+                             cam.name, e)
+                # Preserve whatever the supervisor knew before.
+                for prev in supervisor.cams:
+                    if prev.name == cam.name:
+                        proxy_cams.append(prev)
+                        break
+        supervisor.set_cams(proxy_cams)
+        supervisor.restart()
+
     def resolve_all(self, cams: List[Camera]) -> List[Camera]:
         ok: List[Camera] = []
         for cam in cams:
             try:
                 cam.rtsp_url = resolve_rtsp_url(cam, self.cfg["auth"]["timeout"])
-                logger.info("resolved %s -> %s", cam.name, cam.rtsp_url)
+                # Redact userinfo so the log doesn't carry the password in
+                # cleartext (it's there when inject_credentials is on).
+                logger.info("resolved %s -> %s", cam.name, _redact_url(cam.rtsp_url))
                 ok.append(cam)
             except Exception as e:
                 logger.error("failed to resolve %s: %s", cam.name, e)
@@ -792,8 +1008,13 @@ class Orchestrator:
                     logger.info("next rotation: %s",
                                 next_rot.isoformat(timespec="seconds"))
                 if supervisor and not supervisor.is_alive():
-                    logger.warning("go2rtc died, restarting")
-                    supervisor.restart()
+                    # Don't blindly restart with the previous /tmp config:
+                    # if the cam URL changed (DHCP, reboot, port change),
+                    # the old URL is dead and go2rtc would loop trying to
+                    # reach it. Re-run discovery+resolve first, swap the
+                    # cam list, then restart go2rtc with a fresh config.
+                    logger.warning("go2rtc died, re-resolving cameras and restarting")
+                    self._resupervise(supervisor, cams)
                 self.stop_event.wait(timeout=10)
         finally:
             logger.info("stopping %d worker(s)", len(self.workers))
@@ -810,6 +1031,16 @@ class Orchestrator:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _default_config_path() -> str:
+    """Return the default config-file path, honouring XDG_CONFIG_HOME.
+
+    Falls back to `~/.config/onvif-nvr/config.yaml` when XDG_CONFIG_HOME is
+    unset (the freedesktop spec's documented behaviour).
+    """
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "onvif-nvr", "config.yaml")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=PROG,
@@ -818,7 +1049,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "rotates and merges daily).",
         add_help=False,
     )
-    default_cfg = "~/.config/onvif-nvr/config.yaml"
+    default_cfg = _default_config_path()
     p.add_argument("-c", "--config", default=default_cfg, metavar="FILE",
                    help=f"path to YAML config (default: {default_cfg}; pass /dev/null "
                         "to run with built-in defaults only)")

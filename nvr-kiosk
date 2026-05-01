@@ -28,7 +28,7 @@ import time
 from urllib.parse import urlparse
 
 PROG = "nvr-kiosk"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -243,9 +243,16 @@ def main(argv=None) -> int:
     )
     log(args.verbose, "exec: " + " ".join(cmd))
     # Forward SIGTERM/SIGINT semantics to mpv via execv (we replace ourselves).
-    os.execv(player_path, cmd)
-    # Unreachable; execv either succeeds (no return) or raises OSError.
-    return EXIT_USAGE  # pragma: no cover
+    # On success the call never returns. The only way out is OSError —
+    # typically EACCES (binary not executable), ENOEXEC (bad shebang), or
+    # ENOMEM. Catching it here keeps the script from leaking a Python
+    # traceback into the kiosk display / journal.
+    try:
+        os.execv(player_path, cmd)
+    except OSError as e:
+        err(f"failed to exec {player_path}: {e.strerror or e}")
+        return EXIT_USAGE
+    return EXIT_USAGE  # pragma: no cover (execv either replaced us or raised)
 
 
 if __name__ == "__main__":
