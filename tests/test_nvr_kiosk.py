@@ -123,6 +123,25 @@ class BuildMpvArgvTests(unittest.TestCase):
         self.assertNotIn("--really-quiet", argv)
         self.assertIn("--demuxer-lavf-o-add=rtsp_transport=udp", argv)
 
+    def test_untimed_present_in_defaults(self):
+        # --untimed is the load-bearing flag for sub-second live-RTSP
+        # latency in a no-audio kiosk (mpv 1.2.0+). Regression guard:
+        # if this assertion ever fails, dad in the pizzeria notices.
+        argv = nk.build_mpv_argv("/usr/bin/mpv", "rtsp://x/y",
+                                 fullscreen=True, loop=True, no_audio=True,
+                                 transport="tcp", verbose=False)
+        self.assertIn("--untimed", argv)
+
+    def test_untimed_present_even_with_audio(self):
+        # --untimed is unconditional — mpv falls back to audio-driven
+        # sync on its own when an audio track is present. Guards against
+        # a future "only add untimed when --no-audio" refactor that
+        # would silently revert the latency fix.
+        argv = nk.build_mpv_argv("/usr/bin/mpv", "rtsp://x/y",
+                                 fullscreen=True, loop=True, no_audio=False,
+                                 transport="tcp", verbose=False)
+        self.assertIn("--untimed", argv)
+
 
 class FetchStreamsTests(unittest.TestCase):
     def test_object_with_streams(self):

@@ -205,8 +205,8 @@ See `nvrd --help` for command-line options.
 If the box is plugged into a TV and you want the camera fullscreen as
 soon as it powers on, use `nvr-kiosk`. It asks the local `go2rtc` API
 for the current stream name (so it survives a camera DHCP change or a
-swap to a different camera) and then exec's `mpv` with low-latency,
-fullscreen, looping flags.
+swap to a different camera) and then exec's `mpv` with low-latency
+(`--untimed`, no audio, no cache), fullscreen, looping flags.
 
 A typical user-mode systemd unit (alongside `nvrd.service`):
 
@@ -282,6 +282,22 @@ the resolved RTSP URL on stdout (useful for shell scripting).
 - Check the journal: `journalctl --user -u nvr-kiosk.service`.
 - `nvr-kiosk` 1.1.0+ catches `OSError` from `os.execv` and prints a
   one-line error if mpv can't be exec'd (wrong arch, bad shebang).
+
+**Kiosk video is noticeably delayed (>1 s behind real time).**
+- `nvr-kiosk` 1.2.0+ already passes mpv's `--untimed` flag, which cuts
+  ~200-500 ms of internal video-clock pacing for a no-audio live feed.
+  If you're still seeing >500 ms after upgrading, the remaining
+  latency is almost certainly TV-side: most consumer TVs add
+  100-300 ms of motion smoothing / image processing on top of
+  whatever HDMI feeds them. Enable "Game mode" or "PC mode" on the
+  TV (label varies by brand) — that bypass typically halves the
+  perceived end-to-end lag and is completely outside mpv's reach.
+- Camera-side latency (encoder GOP size, RTSP server batching) is the
+  other big component, also outside this toolkit's control. Some
+  ONVIF cams expose a "low-latency" / "real-time" stream profile in
+  their web UI worth trying — point the toolkit at it with
+  `onvif-rtsp --profile-index 1` (or whichever index that profile
+  occupies) and update your `nvrd` config accordingly.
 
 **Cam changes IP mid-day and recordings stop.**
 - `nvrd` 1.3.0+ re-resolves cam URLs via `onvif-rtsp` whenever go2rtc

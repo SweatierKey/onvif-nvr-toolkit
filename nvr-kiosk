@@ -28,7 +28,7 @@ import time
 from urllib.parse import urlparse
 
 PROG = "nvr-kiosk"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -141,6 +141,14 @@ def build_mpv_argv(player_path, rtsp_url, *, fullscreen, loop, no_audio,
         "--demuxer-lavf-o-add=fflags=+discardcorrupt",
         "--cache=no",
         "--framedrop=decoder+vo",
+        # --untimed: render every frame the moment it's decoded, ignoring
+        # its PTS. For a no-audio kiosk fed by a live RTSP source this is
+        # what you want — mpv's default video clock waits on the (absent)
+        # audio clock and adds ~200-500 ms of pacing latency that has no
+        # purpose for surveillance use. Trade-off is a small risk of
+        # micro-judder if the camera emits frames at irregular intervals,
+        # which for typical IP cams is imperceptible.
+        "--untimed",
         "--no-input-default-bindings",
         "--osc=no",
         "--osd-level=0",
